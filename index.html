@@ -292,7 +292,7 @@ h1,h2,h3,p{margin:0}
 
     <section>
       <h3>Where videos come from</h3>
-      <p>Only short clips from the channels switched on below can appear. Nothing is recommended by an algorithm.</p>
+      <p>Only short clips (under about three minutes) uploaded by the channels switched on below can appear. Nothing is recommended by an algorithm.</p>
       <div id="srcList"></div>
     </section>
 
@@ -325,8 +325,10 @@ h1,h2,h3,p{margin:0}
 (function(){
 'use strict';
 
-/* ---------- Sources: every clip comes from one of these Shorts lists ---------- */
-/* A channel's Shorts list is "UUSH" + its channel ID without the leading "UC". */
+/* ---------- Sources: every clip is a short upload from one of these channels ---------- */
+/* "UUSH" + a channel ID (minus its leading "UC") marks a channel source. YouTube's embedded player
+   cannot read a Shorts list directly, so the app reads the channel's uploads and removes its
+   long videos and live streams; anything over three minutes is also skipped when it plays. */
 var SOURCES=[
   {id:'sss',   name:'Super Simple Songs',        cat:'Songs',   list:'UUSHLsooMJoIpl_7ux2jvdPB-Q', on:true,  note:'Slow, clear songs written for children learning English.'},
   {id:'mgc',   name:'Mother Goose Club',         cat:'Songs',   list:'UUSHJkWoS4RsldA1coEIot5yDA', on:true,  note:'Classic nursery rhymes sung by real people.'},
@@ -335,7 +337,7 @@ var SOURCES=[
   {id:'khan',  name:'Khan Academy Kids',         cat:'Letters', list:'UUSH2ri4rEb8abnNwXvTjg5ARw', on:true,  note:'Letters, first words and short read-alouds.'},
   {id:'sesame',name:'Sesame Street',             cat:'Words',   list:'UUSHoookXUzPciGrEZEXmh4Jjg', on:true,  note:'Vocabulary, feelings and conversation, built on decades of research.'},
   {id:'caitie',name:'Super Simple Play with Caitie', cat:'Words', list:'UUSHxG6Tbopv4XcHfem65bgFeg', on:true, note:'A teacher talking straight to camera, slowly and clearly.'},
-  {id:'rachel',name:'Ms Rachel',                 cat:'Words',   list:'UUSHG2CL6EUjG8TVT1Tpl9nJdg', on:true,  note:'Speech-focused teaching for toddlers. Used only if her channel has short clips.'},
+  {id:'rachel',name:'Ms Rachel',                 cat:'Words',   list:'UUSHG2CL6EUjG8TVT1Tpl9nJdg', on:true,  note:'Speech-focused teaching for toddlers. Her videos are mostly long, so few clips may appear.'},
   {id:'peppa', name:'Peppa Pig',                 cat:'Stories', list:'UUSHAOtE1V7Ots4DjM8JLlrYgg', on:true,  note:'Simple stories in slow British English.'},
   {id:'bluey', name:'Bluey',                     cat:'Stories', list:'UUSHVzLLZkDuFGAE2BGdBuBNBg', on:true,  note:'Rich, natural family conversation and pretend play.'},
   {id:'num',   name:'Numberblocks',              cat:'Numbers', list:'UUSHPlwvN0w4qFSP1FllALB92w', on:true,  note:'BBC counting and early maths.'},
@@ -359,7 +361,7 @@ var TALK=[
   'Find something in the room that starts with the same sound!'
 ];
 var DEFAULTS={clips:8,breakMin:60,waitSec:5,talkEvery:3,voice:'en-GB',toggles:{}};
-var LIST_TTL=48*3600*1000, SESSION_GAP=30*60*1000;
+var LIST_TTL=48*3600*1000, SESSION_GAP=30*60*1000, MAX_CLIP_SEC=185;
 
 /* ---------- Small helpers ---------- */
 function $(s){return document.querySelector(s);}
@@ -375,7 +377,7 @@ var S=Object.assign({},DEFAULTS,LS.get('settings',{}));
 S.toggles=S.toggles||{};
 var custom=LS.get('custom',[]);     // [{id,name,cat,list,on,custom:true}]
 var picks=LS.get('picks',[]);       // single video IDs the parent added
-var lists=LS.get('lists',{});       // listId -> {t,ids}
+var lists=LS.get('lists2',{});       // listId -> {t,ids}
 var bad=LS.get('bad',[]);           // IDs that refused to play
 var current='home';
 
@@ -418,13 +420,13 @@ function createMain(){
 }
 
 /* Read the video IDs of one playlist with a throwaway hidden player. */
-function fetchList(listId){
+function fetchRaw(listId){
   return new Promise(function(resolve){
     var holder=document.createElement('div'),el=document.createElement('div');
     holder.appendChild(el);$('#loaderBox').appendChild(holder);
-    var p=null,done=false,iv=null;
+    var p=null,done=false,iv=null,grace=null;
     function finish(ids){
-      if(done)return;done=true;clearInterval(iv);clearTimeout(to);
+      if(done)return;done=true;clearInterval(iv);clearTimeout(to);clearTimeout(grace);
       try{if(p&&p.destroy)p.destroy();}catch(e){}
       holder.remove();resolve(ids);
     }
@@ -432,10 +434,20 @@ function fetchList(listId){
     var to=setTimeout(function(){read();finish(null);},9000);
     try{
       p=new YT.Player(el,{width:200,height:200,playerVars:playerVars({listType:'playlist',list:listId}),events:{
-        onReady:function(){read();iv=setInterval(read,350);},
+        onReady:function(){read();if(done)return;iv=setInterval(read,300);grace=setTimeout(function(){read();finish(null);},2500);},
         onError:function(){setTimeout(function(){read();finish(null);},1200);}
       }});
     }catch(e){finish(null);}
+  });
+}
+/* A channel source: uploads minus long videos minus live streams leaves the short clips. */
+function fetchList(listId){
+  if(listId.indexOf('UUSH')!==0)return fetchRaw(listId);
+  var c=listId.slice(4);
+  return Promise.all([fetchRaw('UU'+c),fetchRaw('UULF'+c),fetchRaw('UULV'+c)]).then(function(r){
+    if(!r[0])return null;
+    var skip={};(r[1]||[]).concat(r[2]||[]).forEach(function(v){skip[v]=1;});
+    return r[0].filter(function(v){return !skip[v];});
   });
 }
 var loading={}, loadQueue=[], workers=0;
@@ -451,14 +463,14 @@ function refreshLists(force){
   pump();renderHome();renderSources();
 }
 function pump(){
-  while(workers<2&&loadQueue.length){
+  while(workers<3&&loadQueue.length){
     (function(listId){
       workers++;
       fetchList(listId).then(function(ids){
         workers--;delete loading[listId];
         if(ids)lists[listId]={t:Date.now(),ids:ids};
         else if(!lists[listId])lists[listId]={t:Date.now()-LIST_TTL+3600*1000,ids:[]};  // retry in an hour
-        LS.set('lists',lists);renderHome();renderSources();pump();
+        LS.set('lists2',lists);renderHome();renderSources();pump();
       });
     })(loadQueue.shift());
   }
@@ -545,7 +557,7 @@ function present(item){
   renderDots();updateNext();
 }
 function loadClip(item){
-  item.started=false;item.ended=false;item.played=0;
+  item.started=false;item.ended=false;item.played=0;item.lenOk=false;item.lenTries=0;
   show($('#spinner'),true);
   $('#srcLabel').textContent=item.src.name;
   if(!playerReady){apTimer=setTimeout(function(){if(cur===item)loadClip(item);},400);return;}
@@ -568,6 +580,13 @@ function onState(e){
     return;
   }
   if(e.data===1){
+    if(!cur.lenOk&&cur.src.list.indexOf('UUSH')===0){
+      // Channel sources must stay short: reject long videos and live streams before they count.
+      var item=cur,d=0;try{d=player.getDuration()||0;}catch(_){}
+      if(d>MAX_CLIP_SEC||(!d&&(item.lenTries=(item.lenTries||0)+1)>3)){onError();return;}
+      if(!d){setTimeout(function(){if(cur===item&&pstate===1)onState({data:1});},700);clearTimeout(apTimer);return;}
+      cur.lenOk=true;
+    }
     cur.started=true;cur.ended=false;errStreak=0;
     clearTimeout(apTimer);$('#feed').classList.remove('tap');
     show($('#spinner'),false);show($('#pauseCard'),false);show($('#endCard'),false);
